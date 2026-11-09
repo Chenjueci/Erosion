@@ -1,0 +1,120 @@
+name: Build IPA (main fix)
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '*.md'
+      - '.github/**'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          BEST=""
+          BEST_VER="0"
+          for APP in /Applications/Xcode*.app; do
+            [ -d "$APP" ] || continue
+            DEV="$APP/Contents/Developer"
+            [ -d "$DEV/Platforms/iPhoneOS.platform" ] || continue
+            SDK_VER=$(plutil -extract MinimumSDKVersion raw "$DEV/Platforms/iPhoneOS.platform/Info.plist" 2>/dev/null || echo 0)
+            XC_VER=$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist" 2>/dev/null || echo 0)
+            echo "found $APP (Xcode $XC_VER, iOS SDK $SDK_VER)"
+            if [ "$(printf '%s\n26.0\n' "$SDK_VER" | sort -V | head -1)" = "26.0" ]; then
+              if [ "$(printf '%s\n%s\n' "$BEST_VER" "$XC_VER" | sort -V | tail -1)" = "$XC_VER" ]; then
+                BEST="$DEV"; BEST_VER="$XC_VER"
+              fi
+            fi
+          done
+          if [ -z "$BEST" ]; then
+            echo "::error::no Xcode with iOS 26+ SDK found"
+            ls /Applications | grep -i xcode || true
+            exit 1
+          fi
+          echo "selected Xcode $BEST_VER"
+          sudo xcode-select -s "$BEST"
+          xcodebuild -version
+
+      - name: Resolve ldid
+        run: |
+          if command -v ldid >/dev/null 2>&1; then
+            echo "ldid present: $(command -v ldid)"
+          elif brew install ldid >/dev/null 2>&1 && command -v ldid >/dev/null 2>&1; then
+            echo "ldid installed via brew"
+          else
+            echo "::warning::ldid unavailable, skipping entitlements"
+            echo "SKIP_LDID=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build (ad-hoc, unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Erosion.xcodeproj \
+            -scheme Erosion \
+            -configuration Release \
+            -derivedDataPath build/DerivedDataApp \
+            -destination 'generic/platform=iOS' \
+            build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            ASSETCATALOG_COMPILER_OPTIMIZATION=space \
+            DEPLOYMENT_POSTPROCESSING=YES \
+            STRIP_SWIFT_SYMBOLS=YES \
+            SEPARATE_STRIP=YES \
+            STRIP_STYLE=all 2>&1 | tee build.log
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="build/DerivedDataApp/Build/Products/Release-iphoneos/Erosion.app"
+          [ -d "$APP" ] || { echo "::error::app not found, see log"; tail -60 build.log; exit 1; }
+          codesign --remove "$APP" 2>/dev/null || true
+          rm -rf "$APP/_CodeSignature" "$APP/embedded.mobileprovision"
+          find "$APP" -name '_CodeSignature' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$APP" -name 'CodeResources' -delete 2>/dev/null || true
+          if [ "${SKIP_LDID:-0}" = "1" ]; then
+            echo "[*] skipping entitlements (no ldid)"
+          else
+            echo "[*] applying entitlements with ldid"
+            ldid -S"Erosion/Erosion.entitlements" "$APP"
+          fi
+          rm -rf Payload Erosion.ipa
+          mkdir -p Payload
+          cp -R "$APP" "Payload/Erosion.app"
+          zip -qry Erosion.ipa Payload
+          ls -lh Erosion.ipa
+          [ -f "Payload/Erosion.app/Erosion" ] || { echo "::error::missing executable"; exit 1; }
+          if [ -e "Payload/Erosion.app/embedded.mobileprovision" ]; then
+            echo "::error::provision still present"; exit 1
+          fi
+          echo "built version: $(plutil -extract CFBundleShortVersionString raw "Payload/Erosion.app/Info.plist")"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Erosion-ipa
+          path: Erosion.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
